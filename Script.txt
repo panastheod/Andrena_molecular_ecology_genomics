@@ -1,0 +1,933 @@
+#######################################Genome assembly
+perl wengan.pl -x pacraw -a M -s AV_clean_L004_R1_001.fastq.gz,AV_clean_L004_R2_001.fastq.gz -l AV_hifi.fastq.gz -p asm1 -t 112 -g 350
+
+spades.py --pe1-1 AV_FKDN240239034-1A_HLWGHDSXC_L4_clean_1.fq.gz --pe1-2 AV_FKDN240239034-1A_HLWGHDSXC_L4_clean_2.fq.gz --pe1-1 AV_FKDN240239034-1A_H77JKDSXC_L2_clean_1.fq.gz --pe1-2 AV_FKDN240239034-1A_H77JKDSXC_L2_clean_2.fq.gz --pacbio AV_hifi.fastq -t 115 -o 
+
+##############Quality filtering and adapter trimming
+bash
+########bbmap bbduk for quality filtering and adapter trimming############
+# Loop over each R1 fastq file in the specified directory
+for i in `ls -1 /home/sequences/*_L004_R1_001.fastq.gz`; \
+do
+    # Extract the directory name from the file path of each file
+    dname=$(dirname ${i})
+    # Extract the base name of the file, removing the suffix "_L004_R1_001.fastq.gz"
+    name=$(basename ${i} _L004_R1_001.fastq.gz)
+    
+    # Run bbduk for quality filtering and adapter trimming
+    /home/bbmap/bbduk.sh \
+        in1=${dname}/${name}_L004_R1_001.fastq.gz \         # Specify the input file for R1 (forward reads)
+        in2=${dname}/${name}_L004_R2_001.fastq.gz \         # Specify the input file for R2 (reverse reads)
+        out1=/scratch/clean/${name}_clean_L004_R1_001.fastq.gz \ # Output for cleaned R1 reads
+        out2=/scratch/clean/${name}_clean_L004_R2_001.fastq.gz \ # Output for cleaned R2 reads
+        ref=/home/bbmap/resources/nextera.fa.gz \ # Reference file for adapter sequences (e.g., Nextera adapters)
+        ktrim=r \                   # Trim adapters from the right end of reads
+        k=17 \                      # Use a k-mer length of 17 for adapter detection
+        mink=8 \                    # Minimum k-mer length of 8 for matching
+        hdist=1 \                   # Allow up to 1 mismatch in k-mer matching
+        tpe \                       # Trim paired-end reads together (ensure sync between R1 and R2)
+        tbo \                       # Trim adapters based on both ends of the reads
+        qtrim=rl \                  # Quality trimming from both ends of the reads
+        trimq=10 \                  # Quality threshold of 10 for trimming bases
+        ordered=t \                 # Process reads in an ordered manner (keeps read pairs in sync)
+        threads=112 \               # Use 112 threads for parallel processing
+        stats=trimstats.txt ;       # Output trimming statistics to trimstats.txt
+    
+done
+
+#####################Mapping and snp calling
+
+bash
+##### Make directories for SNP calling #####
+mkdir bam  # Create directories for BAM files
+
+##### Specify genome file location #####
+genome=/scratch/genome/genomic.fna.gz  # Set path to reference genome
+
+##### Index the genome with BWA #####
+bwa-mem2 index $genome  # Index the genome file for alignment using bwa-mem2
+
+##### Run a loop to map, index, and remove PCR duplicates #####
+# Loop over each R1 clean fastq file
+for i in `ls -1 /scratch/clean/*_clean_L004_R1_001.fastq.gz`
+do
+    # Get directory and base name of each input file
+    dname=$(dirname ${i})
+    name=$(basename ${i} _clean_L004_R1_001.fastq.gz)
+    echo "Processing sample: $name"  # Display the name of the sample being processed
+   
+    # Define input files for R1 and R2 reads
+    in1=${dname}/${name}_clean_L004_R1_001.fastq.gz
+    in2=${dname}/${name}_clean_L004_R2_001.fastq.gz
+    
+    # Define paths for BAM, sorted BAM, and remove duplicates BAM files
+    bam=/scratch/bam/${name}.aligned.bam
+    sorted_bam=/scratch/bam/${name}.aligned.sorted.bam
+    rmd_bam=/scratch/bam/${name}.rmd.bam
+          
+    # Step 1: Align reads to the reference genome
+    bwa-mem2 mem -t 112 $genome $in1 $in2 | \
+        samtools view -@ 110 -bSu - > $bam  # Convert SAM to BAM on the fly
+
+    # Step 2: Sort the BAM file
+    samtools sort -@ 112 -o $sorted_bam $bam  # Sort BAM file for downstream use
+
+    # Step 3: Index the sorted BAM file
+    samtools index -@ 112 $sorted_bam  # Create index for the sorted BAM
+
+    # Step 4: Remove PCR duplicates using GATK MarkDuplicates
+    /home/Downloads/gatk-4.2.2.0/gatk --java-options "-Xmx100G" MarkDuplicates \
+        I=$sorted_bam \
+        O=$rmd_bam \
+        REMOVE_DUPLICATES=true \
+        M=${name}.duplicates.txt  # Remove duplicates stats
+
+    # Step 5: Index the remove duplicates BAM file
+    samtools index -@ 112 $rmd_bam  # Create index for the deduplicated BAM file
+
+done 
+
+##### Create a list of BAM files for SNP calling #####
+# Move to the directory containing deduplicated BAM files
+cd /scratch/panas/bam/
+# Generate a list of all BAM files, saving it as all_bams.list
+ls *.rmd.bam > all_bams.list
+
+
+#### CallVariants SNP Caller ####
+/home/Downloads/bbmap/callvariants.sh \
+    ref=/scratch/genomic.fna.gz \   # Reference genome file
+    list=all_bams.list \                  # List of deduplicated BAM files for variant calling
+    out=XXcv.vcf \                        # Output VCF file with SNP calls
+    ploidy=2 \                            # Ploidy level of the organism (2 for diploid)
+    multisample=t \                       # Enable multisample SNP calling (processes all BAM files as samples)
+    ow=t \                                # Overwrite the output file if it already exists
+    nopassdot=f \                         # Show dots in VCF for low-quality sites
+    minad=2 \                             # Minimum allele depth (number of supporting reads) to call a variant
+    minavgmapq=15 \                       # Minimum average mapping quality for reads at a position
+    minreadmapq=15 \                      # Minimum mapping quality of individual reads
+    strandedcov=t \                       # Enable stranded coverage calculation
+    -Xmx501593m                           # Set maximum memory allocation (approximately 501GB)
+
+##################SNP filtering
+
+#### Zip and Index VCF Files ####
+bgzip -c XXcv.vcf > XXcv.vcf.gz            # Compress the VCF file with bgzip
+tabix -p vcf XXcv.vcf.gz                   # Index the compressed VCF file for fast access
+
+
+######## VCF Filtering with VCFtools ########
+vcftools --gzvcf XXcv.vcf.gz --max-missing 0.5 --mac 3 --minQ 30 \
+    --recode --recode-INFO-all --out raw.g5mac3
+
+vcftools --gzvcf raw.g5mac3.vcf.gz --minDP 3 \
+    --recode --recode-INFO-all --out raw.g5mac3dp3
+# Parameters:
+# --max-missing 0.5: Filter SNPs called in less than 50% of individuals
+# --mac 3: Retain SNPs with a minimum minor allele count of 3
+# --minQ 30: Minimum quality threshold of 30 for including variants
+# --minDP 3: Minimum depth per site of 3 for each SNP
+# --recode: Output a filtered VCF file with the specified conditions
+# --recode-INFO-all: Retain all INFO fields in the recoded file
+# --out: Specify the output file name for the filtered VCF
+
+### Download ErrorCount.sh Script, Make it Executable, and Run to Check Potential Genotyping Errors ###
+curl -L -O https://github.com/jpuritz/dDocent/raw/master/scripts/ErrorCount.sh  # Download ErrorCount.sh
+chmod +x ErrorCount.sh                             # Make the script executable
+./ErrorCount.sh raw.g5mac3dp3.recode.vcf > errorcount  # Run the script and output results to errorcount
+
+# This script calculates potential genotyping errors due to low read depth.
+# It estimates the error range based on probabilities for observing alternative alleles.
+# The results summarize potential error rates for genotypes with low read depth.
+
+### Filter Individuals Based on Relatedness and Missingness ###
+vcftools --vcf raw.g5mac3dp3.recode.vcf --relatedness2  # Calculate relatedness between individuals
+# Retain individuals with a relatedness score less than 0.20 and remove those above this threshold.
+
+vcftools --vcf raw.g5mac3dp3.recode.vcf --missing-indv  # Check missingness for each individual
+# Identify individuals with high levels of missing data (e.g., more than 50%).
+
+# Generate a list of individuals with more than 50% missing data:
+mawk '$5 > 0.5' out.imiss | cut -f1 > lowDP.indv       # Filter individuals with >50% missing data
+
+# Remove individuals with high missingness from the dataset:
+vcftools --vcf raw.g5mac3dp3.recode.vcf --remove lowDP.indv \
+    --recode --recode-INFO-all --out raw.g5mac3dplm   # Output new VCF after removing low-quality individuals
+
+#### Main VCF Filtering with Comprehensive Parameters for genetic diversity, genetic divergence and population genetic structure ####
+vcftools --gzvcf /scratch/XXX.vcf.gz \
+    --max-missing 0.95 --maf 0.05 --mac 3 --minQ 30 --min-meanDP 5 \
+    --max-meanDP 50 --remove-indels --recode --recode-INFO-all --out DP5g90maf05q30
+
+# Parameters:
+# --max-missing 0.95: Keep variants called in at least 95% of individuals   ###### for the selection vcf we used 0.75
+# --maf 0.05: Minimum allele frequency of 5%
+# --mac 3: Minimum allele count of 3
+# --minQ 30: Minimum quality score of 30
+# --min-meanDP 5: Minimum average depth per SNP site of 5
+# --max-meanDP 50: Maximum average depth per SNP site of 50
+# --remove-indels: Exclude indels (insertions and deletions)
+# --recode: Output a filtered VCF file
+# --recode-INFO-all: Retain all INFO fields in the recoded file
+
+### Additional QC: Heterozygosity and Hardy-Weinberg Equilibrium Checks ###
+vcftools --vcf BDP5g95maf05q30.recode.vcf --het --out test_het      # Check observed heterozygosity
+vcftools --vcf DP5g95maf05q30.recode.vcf --hardy --out test_hwe    # Check Hardy-Weinberg equilibrium
+
+##### Filter SNPs Based on Mean Observed Heterozygosity > 0.6 #####
+python SnpsHE.py   # Run custom Python script to identify SNPs with high heterozygosity (potential errors)
+
+######################################################SnpsHE.py
+#!/usr/bin/env python
+# coding: utf-8
+
+# read HWE.txt file in read mode
+with open("test_hwe.hwe", "r") as f:
+    # add chr and pos to results for entry whose obs het > 60
+    results = []
+    # iterate over each line except first header line
+    for line in f.readlines()[1:]:
+        # extract chr, pos and obs entry
+        Chr, pos, obs = line.strip().split("\t")[:3]
+        # extract obs het from obs
+        x1, x2, x3 = list(map(int, obs.strip().split("/")))
+        het_pcent = (x2*100)/(x1+x2+x3)
+        
+        # check if obs het percentage > 60
+        if het_pcent > 60:
+            # write it into results list
+            entry = Chr + "\t" + pos
+            results.append(entry)
+
+# create a file output.txt and write results into it
+with open("SNPShighPropHE.txt", "w") as f:
+    # write header CHR and POS
+    f.write("CHR\tPOS\n")
+    # write each entry of the results list
+    for entry in results:
+        f.write(entry + "\n")
+##################################################################
+
+# Remove SNPs with high heterozygosity (>0.6):
+grep -Fwvf SNPShighPropHE.txt BDP5g95maf05q30.recode.vcf > filteredHet.vcf
+bgzip -c filteredHet.vcf > filteredHet.vcf.gz       # Compress filtered VCF
+tabix -p vcf DP5g95maf05q30filteredHe.vcf.gz                       # Index the filtered VCF file
+
+### Linkage Pruning ##############we did not do this for the selection vcf file
+
+# Step 1: Linkage pruning with plink2
+plink2 --vcf DP5g95maf05q30filteredHe.vcf \             # Input VCF file
+    --double-id \                                         # Assign identical sample IDs to Family ID and Individual ID
+    --allow-extra-chr \                                   # Allow analysis of non-standard chromosome names
+    --set-missing-var-ids @:#\$r:\$a \                    # Set unique IDs for any SNPs with missing IDs (using position and alleles)
+    --indep-pairwise 50 5 0.5 \                           # Linkage pruning parameters:
+                                                         # - 50 SNP window
+                                                         # - 5 SNP slide
+                                                         # - Maximum correlation (R^2) threshold of 0.5
+    --out XXX                                           # Output prefix for pruned SNPs
+
+# Explanation of --indep-pairwise 50 5 0.5:
+# This removes all SNPs with an R^2 (pairwise correlation) above 0.5 in a 50-SNP window, sliding forward by 5 SNPs each time.
+
+####### Remove Pruned SNPs#######
+
+plink2 --vcf DP5g95maf05q30filteredHe.vcf \            # Input VCF file for LD-pruned data
+    --double-id \                                         # Set double ID for sample consistency
+    --allow-extra-chr \                                   # Allow non-standard chromosomes
+    --set-missing-var-ids @:#\$r:\$a \                    # Generate unique SNP IDs where needed
+    --extract XXX.prune.in \                            # Only keep SNPs retained after pruning (from .prune.in file)
+    --make-bed \                                          # Convert to binary PLINK format (BED)
+    --pca \                                               # Calculate PCA for population structure
+    --out XXXadm                                        # Output prefix for the binary file and PCA results
+
+##### Convert Binary PLINK to VCF Format #####
+
+plink2 --bfile XXXadm \                                 # Input binary PLINK file
+    --recode vcf \                                        # Recode output to VCF format
+    --double-id \                                         # Set double ID format
+    --allow-extra-chr \                                   # Allow non-standard chromosomes
+    --set-missing-var-ids @:#\$r:\$a \                    # Generate unique IDs for missing SNPs
+    --out DP5g95maf05q30filteredHeLDpruned             # Output VCF file after linkage pruning
+
+###################genetic diversity using dartR
+R
+###### Load Required Libraries ######
+library("vcfR")       # For reading VCF files into R
+library("adegenet")   # Provides genetic analysis tools and data structures
+library("hierfstat")  # For population genetic statistics
+library("dartR")      # Specialized tools for SNP data analysis and heterozygosity reports
+
+###### Load VCF Data ######
+vcf <- read.vcfR("DP5g95maf05q30filteredHeLDpruned.vcf")     # Read compressed VCF file containing SNP data
+
+###### Convert VCF Data to genlight Object ######
+gl <- vcfR2genlight(vcf)                  # Convert VCF to genlight format, optimized for population genetics in `dartR` and `adegenet`
+
+###### Load Population Data and Assign Populations ######
+pop.data <- read.table("Pop.txt", sep = "\t", header = TRUE)  # Read population data table
+pop.data$pop <- as.factor(pop.data$pop)   # Convert population data to factor for grouping
+ploidy(gl) <- 2                           # Set ploidy level to 2 (for diploid data)
+pop(gl) <- pop.data$pop                   # Assign population labels to genlight object
+
+###### Check Data and Report Heterozygosity ######
+gl                                        # Display summary of the genlight object
+glx <- gl.compliance.check(gl)            # Check data for compliance with dartR requirements (e.g., missing data)
+
+###### Report Expected Heterozygosity by Population ######
+df <- gl.report.heterozygosity(glx, method = "pop", plot.out = FALSE)  
+# Calculate expected heterozygosity for each population in `glx`
+# - method = "pop": Calculate heterozygosity by population
+# - plot.out = FALSE: Suppress automatic plotting of results
+
+
+#####################genetic divergence using stampp
+
+R
+###### Load Required Libraries ######
+library(vcfR)      # For reading and processing VCF files in R
+library(StAMPP)    # Provides tools for population differentiation and genetic distance analysis
+
+###### Read and Convert VCF File to genlight Object ######
+vcf <- read.vcfR("DP5g95maf05q30filteredHeLDpruned.vcf")   # Load VCF file containing SNP data
+x <- vcfR2genlight(vcf)                   # Convert VCF data to a genlight object for further processing
+
+###### Prepare Population Names ######
+# Convert the genlight object to a matrix format compatible with StAMPP
+x2 <- as.matrix(x)                        # Convert genlight to matrix format
+sample <- row.names(x2)                   # Extract sample names from matrix rows
+
+# Specify population names manually as a vector, matching the number of samples in x2
+pop.names <- c("1", "1", "1", "1", "2", "2", "2", "2", "3", "3", "3", "3")
+
+###### Convert Allele Counts to Frequencies and Prepare Data for StAMPP ######
+ploidy <- ploidy(x)                       # Extract ploidy information from genlight object
+x2 <- x2 * (1/ploidy)                     # Convert allele counts to frequencies by dividing by ploidy
+x2[is.na(x2)] <- NaN                      # Replace NAs with NaN for StAMPP compatibility
+
+# Create a format identifier for StAMPP
+format <- rep("freq", length(sample))     # Specify "freq" format for allele frequency data
+
+# Combine sample, population names, ploidy, format, and frequency data into a single data frame
+x.stampp <- as.data.frame(cbind(sample, pop.names, ploidy, format, x2))
+
+# Convert to StAMPP format
+geno <- stamppConvert(x.stampp, 'r')      # Convert to StAMPP-compatible format for analysis
+
+###### Calculate Fst and Bootstrap Confidence Intervals ######
+fst <- stamppFst(geno, nboots = 100, percent = 95, nclusters = 1)
+
+# Save Fst analysis results
+write.csv(fst$Bootstraps, "Genetic_distances_bootstraps.csv")  # Bootstrap values
+write.csv(fst$Pvalues, "Genetic_distances_Pvalues.csv")        # P-values for Fst significance
+write.csv(fst$Fsts, "Genetic_distances_Fsts.csv")              # Fst values between populations
+
+
+############### population genetic structure and pca plot
+R
+######## Load Required Libraries ########
+library("vcfR")         # For reading VCF files in R
+library("adegenet")     # For DAPC analysis and genetic data structures
+
+######## Set Working Directory ########
+#setwd("xxxxxxx")  # Set your working directory (optional)
+
+######## Read and Convert VCF File ########
+vcf <- read.vcfR("DP5g95maf05q30filteredHeLDpruned.vcf")   # Load compressed VCF file
+gl <- vcfR2genlight(vcf)                             # Convert VCF data to a genlight object for compatibility with `adegenet`
+
+######## Load Population Data ########
+pop.data <- read.table("Pop.txt", sep = "\t", header = TRUE)   # Load population information
+pop(gl) <- as.factor(pop.data$pop)                  # Assign population data to genlight object
+
+######## find clusters ########
+grp <- find.clusters(gl, max.n.clust = 19)          # Use `find.clusters` to identify clusters
+# - max.n.clust = 19: Set the maximum number of clusters, looking for a plateau in BIC plot
+
+library(ggplot2)
+library(ggforce)
+library(RColorBrewer)  # Load RColorBrewer for color palettes
+
+# Generate a print-friendly color palette based on the number of populations
+cols <- brewer.pal(n = nPop(gl), name = "Paired")
+
+# Extract PCoA scores
+pc_scores <- as.data.frame(pc$scores)  # Extract PCoA coordinates
+pc_scores$pop <- gl$pop  # Assign population data
+
+# Compute mean coordinates for each population (center of ellipse)
+pop_centers <- aggregate(cbind(PC1, PC2) ~ pop, data = pc_scores, FUN = mean)
+
+# Plot PCoA with ellipses and population labels using RColorBrewer colors
+ggplot(pc_scores, aes(x = PC1, y = PC2, color = pop)) +
+  geom_point(size = 3, alpha = 0.8) +  # Plot individual points
+  stat_ellipse(aes(group = pop), level = 0.95, linetype = "solid") +  # Add ellipses
+  geom_label(data = pop_centers, aes(x = PC1, y = PC2, label = pop, color = pop), 
+             fill = "white", fontface = "bold", size = 4, label.size = 0.3, 
+             label.r = unit(0.15, "lines")) +  # White fill, colored stroke
+  scale_color_manual(values = cols) +  # Use RColorBrewer colors for points & text
+  theme_minimal() +
+  labs(title = "PCoA with Population Ellipses", x = "PC1", y = "PC2") +
+  theme(
+    legend.position = "right",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 10),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10)
+  )
+  
+##################### for selection analyses
+
+##############calculate allele frequencies
+#!/bin/bash
+
+# Step 1: Subset VCF based on specific sample groups
+echo "Subsetting VCF based on sample groups..."
+for group in IW.txt ES.txt JK.txt TW.txt KZ.txt MS.txt MB.txt TU.txt RK.txt TS.txt MD.txt; do
+
+    vcftools --vcf AVNormImputedData.vcf \
+             --keep $group \
+             --recode \
+             --out $group
+
+    echo "Subset created for $group."
+done
+
+
+# Step 2: Analyze allele frequencies for each subset
+echo "Analyzing allele frequencies for each subset..."
+for group in  S.txt VE.txt SH.txt TU.txt EF.txt GA.txt JKI.txt M.txt F.txt B.txt; do
+    plink2 --vcf ${group}.recode.vcf \
+           --double-id \
+           --allow-extra-chr \
+           --set-all-var-ids @:#:\$r:\$a \
+           --freq \
+           --out $group
+    echo "Allele frequency analysis completed for $group."
+done
+echo "Allele frequency analysis for all groups completed."
+
+echo "Pipeline execution completed."
+
+### Step 3: Merge Allele Frequency Files ###
+python merge_afreq.py ./output.txt
+# Run `merge_afreq.py` to merge allele frequency results for each population into a single file
+##############################merge_afreq.py
+#!/usr/bin/env python
+# coding: utf-8
+
+import os, glob, argparse, csv, re
+
+def read_header_index(filename):
+    with open(filename, "r", newline="") as f:
+        reader = csv.reader(f, delimiter="\t")
+        header = next(reader)
+    return {name: i for i, name in enumerate(header)}
+
+def get_ID(filename):
+    """
+    Build IDs as CHROM:POS:REF:ALT using header-based indexing.
+    Works whether POS is present or not; if POS missing, falls back to VCF ID.
+    """
+    idx = read_header_index(filename)
+    ids = ["Pop"]
+    with open(filename, "r", newline="") as f:
+        reader = csv.reader(f, delimiter="\t")
+        _ = next(reader)  # skip header
+        for row in reader:
+            if "POS" in idx:  # preferred path when POS is present
+                chrom = row[idx["#CHROM"]]
+                pos   = row[idx["POS"]]
+                ref   = row[idx["REF"]]
+                alt   = row[idx["ALT"]]
+                ids.append(f"{chrom}:{pos}:{ref}:{alt}")
+            else:
+                # Fallback if POS not in .afreq: use ID plus alleles if available
+                if "ID" in idx and row[idx["ID"]] != ".":
+                    ids.append(row[idx["ID"]])
+                else:
+                    chrom = row[idx["#CHROM"]]
+                    ref   = row[idx["REF"]]
+                    alt   = row[idx["ALT"]]
+                    ids.append(f"{chrom}:{ref}:{alt}")
+    return ids
+
+def pop_name_from_filename(filename, upper=False, drop_trailing_ED=False):
+    base = os.path.basename(filename)
+    stem = base[:-len(".afreq")] if base.lower().endswith(".afreq") else os.path.splitext(base)[0]
+    if upper: stem = stem.upper()
+    if drop_trailing_ED: stem = re.sub(r'ED$', '', stem, flags=re.IGNORECASE)
+    return stem
+
+def get_ALT_FREQS(filename, *, upper=False, drop_trailing_ED=False):
+    pop = pop_name_from_filename(filename, upper=upper, drop_trailing_ED=drop_trailing_ED)
+    idx = read_header_index(filename)
+    alt_freq_col = idx.get("ALT_FREQS")
+    if alt_freq_col is None:
+        raise ValueError(f"ALT_FREQS column not found in {filename}")
+    values = [pop]
+    with open(filename, "r", newline="") as f:
+        reader = csv.reader(f, delimiter="\t")
+        _ = next(reader)  # skip header
+        for row in reader:
+            values.append(row[alt_freq_col])
+    return values
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Merge .afreq files in a folder.")
+    parser.add_argument("dir_path", help="Path to the directory containing .afreq files.")
+    parser.add_argument("out_path", help="Output path for merged table.")
+    parser.add_argument("--upper", action="store_true", help="Uppercase population names.")
+    parser.add_argument("--drop-ed", action="store_true", help="Drop trailing 'ED' from pop names.")
+    args = parser.parse_args()
+
+    filenames = sorted(glob.glob(os.path.join(os.path.normpath(args.dir_path), "*.afreq")))
+    if not filenames:
+        raise SystemExit("No .afreq files found.")
+
+    ID_list = get_ID(filenames[0])
+    ALT_FREQS_list = [get_ALT_FREQS(fn, upper=args.upper, drop_trailing_ED=args.drop_ed) for fn in filenames]
+    ALT_FREQS_list.sort(key=lambda x: x[0].upper())
+
+    with open(args.out_path, "w", newline="") as out:
+        out.write("\t".join(ID_list) + "\n")
+        for row in ALT_FREQS_list:
+            out.write("\t".join(row) + "\n")
+######################################################
+####################LFMM
+#####lfmm permutations
+library(lfmm)
+library(data.table)
+# Load your genotype matrix
+frq <- fread("output.txt", header = TRUE, sep = "\t")
+gen <- as.matrix(frq[, 2:ncol(frq)])  # Assuming 1st column = ID
+# Load environment
+env <- read.table("lfmm2env.txt", sep = "\t", header = TRUE)
+pred <- env$urban
+
+# Set number of permutations
+n_perm <- 100
+all_perm_pvalues <- c()
+
+for (i in 1:n_perm) {
+  cat("Permutation:", i, "\n")
+  
+  # Shuffle the environmental variable
+  pred_perm <- sample(pred)
+
+  # Fit LFMM and test
+  model_perm <- lfmm_ridge(Y = gen, X = pred_perm, K = 1)
+  test_perm  <- lfmm_test(Y = gen, X = pred_perm, lfmm = model_perm, calibrate = "gif")
+  
+  # Collect all p-values
+  all_perm_pvalues <- c(all_perm_pvalues, test_perm$calibrated.pvalue)
+}
+threshold_empirical <- quantile(all_perm_pvalues, 0.001)  # 0.1th percentile
+print(threshold_empirical)
+# Run on real data again (if not already done)
+AF.lfmm <- lfmm_ridge(Y = gen, X = pred, K = 1)
+AF.pv   <- lfmm_test(Y = gen, X = pred, lfmm = AF.lfmm, calibrate = "gif")
+real_pvalues <- AF.pv$calibrated.pvalue
+
+# Apply empirical cutoff
+significant_lfmm <- which(real_pvalues < threshold_empirical)
+length(significant_lfmm)
+results <- data.frame(SNP = colnames(gen), pvalue = real_pvalues)
+results$significant <- results$pvalue < threshold_empirical
+write.csv(results, "lfmm_significant_hits.csv", row.names = FALSE)
+
+########gradient forest
+library(data.table)
+library(gradientForest)
+
+# --- 1. Load and prepare data ---
+env <- fread("env.txt", header = TRUE)
+bt  <- fread("genotypes.txt", header = TRUE)
+gen <- bt[, 2:558879]
+
+# Fix invalid SNP names (":" etc.)
+setnames(gen, make.names(colnames(gen)))
+
+# --- 2. Set parameters ---
+chunk_size <- 500
+ntree <- 500
+corr_thres <- 0.5
+maxLevel <- log2(0.368 * nrow(env) / 2)
+nchunks <- ceiling(ncol(gen) / chunk_size)
+
+# --- 3. Loop through chunks ---
+imp.list <- list()
+
+for (i in seq_len(nchunks)) {
+  cat("\n=== Processing chunk", i, "of", nchunks, "===\n")
+  
+  idx <- ((i - 1) * chunk_size + 1):min(i * chunk_size, ncol(gen))
+  gen.sub <- gen[, ..idx]
+  data.gf <- cbind(env, gen.sub)
+  
+  gf <- gradientForest(
+    data.gf,
+    predictor.vars = colnames(env),
+    response.vars  = colnames(gen.sub),
+    ntree = ntree,
+    maxLevel = maxLevel,
+    corr.threshold = corr_thres,
+    trace = FALSE
+  )
+  
+  # Extract importance matrix from this chunk
+  imp_matrix <- gf$imp.rsq
+  imp_dt <- as.data.table(t(imp_matrix))  # transpose: one row per SNP
+  setnames(imp_dt, "V1", colnames(env))   # rename column to environmental variable name
+  imp_dt[, SNP := rownames(imp_matrix)]
+  imp.list[[i]] <- imp_dt
+}
+
+# --- 4. Combine all importance tables ---
+imp_total <- rbindlist(imp.list, fill = TRUE)
+
+# If you have one environmental variable:
+env_name <- colnames(env)[1]
+importance_scores <- imp_total[[env_name]]
+names(importance_scores) <- imp_total$SNP
+
+# --- 5. Sort and extract top 1% ---
+sorted_scores <- sort(importance_scores, decreasing = TRUE)
+top_1_percent <- sorted_scores[1:round(length(sorted_scores) * 0.01)]
+
+# --- 6. Save results ---
+write.table(
+  top_1_percent,
+  file = "top_snps_to_extract.txt",
+  quote = FALSE,
+  row.names = TRUE,
+  col.names = FALSE
+)
+
+# --- 7. (Optional) Save full importance ranking ---
+write.table(
+  sorted_scores,
+  file = "all_snp_importance_ranked.txt",
+  quote = FALSE,
+  row.names = TRUE,
+  col.names = FALSE
+)
+
+cat("\n✅ GradientForest analysis complete. Top 1% SNPs saved to 'top_snps_to_extract.txt'.\n")
+
+
+##############################
+#
+#  SELECTIVE SWEEPS
+#
+##########################
+
+# Step 1: Compress the VCF file using bgzip (block gzip format required for tabix)
+bgzip -c AV_DP5g75maf05I114filteredHe.recode.vcf > AV_DP5g75maf05I114filteredHe.recode.vcf.gz
+
+# Step 2: Index the compressed VCF with tabix for region-based access
+tabix -p vcf AV_DP5g75maf05I114filteredHe.recode.vcf.gz
+
+# Step 3: Create a BED-like region file for contigs with multiple SNPs
+# - Output format: CHROM  START  END
+# - Use large coordinate range to include the entire contig
+bcftools query -f '%CHROM\n' AV_DP5g75maf05I114filteredHe.recode.vcf.gz | \
+    sort | uniq -c | awk '$1>1 {print $2 "\t0\t999999999"}' > keep_regions.txt
+
+# Step 4: Filter the VCF to keep only the contigs listed in keep_regions.txt
+# -R: specify regions to include
+# -Oz: output in bgzipped VCF format
+# -o: specify output file name
+bcftools view -R keep_regions.txt AV_DP5g75maf05I114filteredHe.recode.vcf.gz -Oz -o AV_filtered_scaffolds.vcf.gz
+
+# Step 5: Index the filtered VCF for downstream tools
+tabix -p vcf AV_filtered_scaffolds.vcf.gz
+
+bcftools query -f '%CHROM\n' AFNormImputedData.vcf.gz | sort | uniq > chrom_list.txt
+
+run_nsl_by_chr.sh
+
+for f in *_nsl.nsl.out; do
+  chr=$(echo "$f" | sed 's/_nsl\.nsl\.out//')
+  echo "Fixing $f (CHR = $chr)"
+  awk -v chr="$chr" '{$1=chr; print}' OFS="\t" "$f" > tmp && mv -f tmp "$f"
+done
+
+
+cat *_nsl.nsl.out > allchr_nsl.out
+norm --nsl --bins 100 --files allchr_nsl.out
+awk '{if($7=="-nan" || $7=="nan") c++} END{print "NaN SNPs:", c}' allchr_nsl.out.100bins.norm
+
+########then in r################
+# ==============================================================
+# nSL OUTLIER ANALYSIS PIPELINE  — DIRECT INPUT VERSION
+# ==============================================================
+# Input file: allchr_nsl.out.100bins.norm
+# Columns: CHR POS FREQ EHH_A EHH_D nSL_raw nSL_norm BIN
+# ==============================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(GenomicRanges)
+})
+
+# 1️⃣ Read normalized nSL results
+nsl <- read.table("allchr_nsl.out.100bins.norm", header=FALSE)
+
+# Assign column names
+colnames(nsl) <- c("CHR", "POS", "FREQ", "EHH_A", "EHH_D", "nSL_raw", "nSL_norm", "BIN")
+
+cat("✅ Loaded", nrow(nsl), "SNPs from allchr_nsl.out.100bins.norm\n")
+
+# ==============================================================
+# Outlier detection criteria
+# ==============================================================
+
+# (a) Fixed |nSL| >= 2
+out_fixed <- nsl %>% filter(abs(nSL_norm) >= 2)
+
+cat("  • |nSL| ≥ 2 (fixed)\n")
+
+# ==============================================================
+# Merge nearby outlier SNPs into genomic regions
+# ==============================================================
+
+toGR <- function(df) GRanges(seqnames=df$CHR, ranges=IRanges(start=df$POS, end=df$POS))
+
+gr_fixed <- if (nrow(out_fixed) > 0) reduce(toGR(out_fixed), min.gapwidth=50000) else GRanges()
+gr_top1  <- if (nrow(out_top1)  > 0) reduce(toGR(out_top1),  min.gapwidth=50000) else GRanges()
+gr_mad   <- if (nrow(out_mad)   > 0) reduce(toGR(out_mad),   min.gapwidth=50000) else GRanges()
+
+# ==============================================================
+# Write output tables
+# ==============================================================
+
+write.table(out_fixed, "outliers_fixed_abs2.tsv", sep="\t", quote=FALSE, row.names=FALSE, col.names=TRUE)
+
+# BED outputs (merged regions)
+write.table(as.data.frame(gr_fixed)[,1:3], "outlier_regions_fixed_abs2.bed", sep="\t", quote=FALSE, row.names=FALSE, col.names=FALSE)
+
+cat("✅ Outlier tables and BED files written.\n")
+
+library(GenomicRanges)
+
+# Load your SNP list
+snps <- read.table("LFMMGF_AF.txt", header=TRUE)
+gr_snps <- GRanges(seqnames=snps$CHR, ranges=IRanges(start=snps$POS, end=snps$POS))
+
+# Load your sweep regions (from nSL outlier pipeline)
+sweeps <- read.table("outlier_regions_fixed_abs2.bed", header = FALSE)
+colnames(sweeps) <- c("CHR", "START", "END")
+gr_sweeps <- GRanges(seqnames = sweeps$CHR,
+                     ranges = IRanges(start = sweeps$START, end = sweeps$END))
+
+# Extend ±10 kb
+gr_sweeps_ext <- resize(gr_sweeps, width = width(gr_sweeps) + 20000, fix = "center")
+
+# Or equivalently:
+# gr_sweeps_ext <- promoters(gr_sweeps, upstream = 10000, downstream = width(gr_sweeps) + 10000)
+
+# Save extended BED
+bed_ext <- data.frame(seqnames = seqnames(gr_sweeps_ext),
+                      start = start(gr_sweeps_ext),
+                      end = end(gr_sweeps_ext))
+write.table(bed_ext, "outlier_regions_abs2_10kb.bed",
+            sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+cat("✅ Extended sweeps written to outlier_regions_abs2_10kb.bed\n")
+
+
+hits <- findOverlaps(gr_snps, gr_sweeps_ext)
+
+# Extract overlapping SNPs
+snps_in_sweeps <- snps[queryHits(hits), ]
+write.table(snps_in_sweeps, "snps_in_sweeps.txt", sep="\t", quote=FALSE, row.names=FALSE)
+cat("Proportion of SNPs in sweeps:",
+    nrow(snps_in_sweeps), "/", nrow(snps), "=",
+    round(100 * nrow(snps_in_sweeps) / nrow(snps), 2), "%\n")
+	
+	
+##########################################################
+#
+#  Manhattan-plot
+##########################################################
+# Read baseline data
+data <- read.table("LFMMbaseline.txt", header = TRUE, sep = "\t")
+data <- data %>%
+  separate(SNP, into = c("CHR", "POS"), sep = "_(?=\\d+$)", convert = TRUE)
+data$CHROM <- as.factor(data$CHR)
+
+# Read outliers LFMM and RDA data
+outliers_lfmm <- read.table("AV_LFMMoutliers.txt", header = TRUE, sep = "\t")
+str(outliers_lfmm)
+outliers_lfmm <- outliers_lfmm %>%
+  separate(SNP, into = c("CHR", "POS"), sep = "_(?=\\d+$)", convert = TRUE)
+
+outliers_GF <- read.table("AVGFtop1percent_snps_to_extract.txt", header = TRUE, sep = "\t")
+str(outliers_GF)
+outliers_GF <- outliers_GF %>%
+  separate(SNP, into = c("CHR", "POS"), sep = "_(?=\\d+$)", convert = TRUE)
+
+outliers_lfmm$CHROM <- as.factor(outliers_lfmm$CHR)
+outliers_GF$CHROM <- as.factor(outliers_GF$CHR)
+
+# Create MergedColumn for all datasets
+data$MergedColumn <- paste(data$CHROM, data$POS, sep = "_")
+outliers_lfmm$MergedColumn <- paste(outliers_lfmm$CHROM, outliers_lfmm$POS, sep = "_")
+outliers_GF$MergedColumn <- paste(outliers_GF$CHROM, outliers_GF$POS, sep = "_")
+
+#write.table(outliers_lfmm, file = "lmm.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+#write.table(outliers_GF, file = "rda.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+
+# Identify common and unique outliers
+common_outliers <- inner_join(outliers_lfmm, outliers_GF, by = c("CHROM", "POS"))
+str(common_outliers)
+#write.table(common_outliers, file = "common.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+
+common_outliers$MergedColumn <- paste(common_outliers$CHROM, common_outliers$POS, sep = "_")
+
+
+unique_lfmm <- outliers_lfmm$MergedColumn[!(outliers_lfmm$MergedColumn %in% outliers_GF$MergedColumn)]
+str(unique_lfmm)
+unique_rda <- outliers_GF$MergedColumn[!(outliers_GF$MergedColumn %in% outliers_lfmm$MergedColumn)]
+str(unique_rda)
+# Assign colors based on outlier membership
+data$color <- ifelse(data$MergedColumn %in% common_outliers$MergedColumn, "common",
+                     ifelse(data$MergedColumn %in% unique_lfmm, "lfmm","grey"))
+
+
+data$outlier_flag <- ifelse(data$MergedColumn %in% common_outliers$MergedColumn, "YES", "NO")
+num_common_outliers <- sum(data$outlier_flag == "YES")
+print(paste("Number of common outliers:", num_common_outliers))
+common_rows <- data %>% filter(outlier_flag == "YES")
+write.table(common_rows, "Common_OutliersLFMMpermGF1percent.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+str(data)
+
+# Step 1: Prepare dataset
+don <- data %>%
+  mutate(
+    logp = -log10(pvalue),
+    is_highlight = ifelse(outlier_flag == "YES", "yes", "no"),
+    is_annotate = ifelse(outlier_flag == "YES", "yes", "no")
+  )
+
+# Step 2: Compute cumulative chromosome positions
+chr_info <- don %>%
+  group_by(CHR) %>%
+  summarise(chr_len = max(POS, na.rm = TRUE)) %>%
+  mutate(tot = cumsum(chr_len) - chr_len)
+
+don <- don %>%
+  left_join(chr_info, by = "CHR") %>%
+  arrange(CHR, POS) %>%
+  mutate(BPcum = POS + tot)
+
+# Step 3: Prepare axis labels
+axisdf <- don %>%
+  group_by(CHR) %>%
+  summarise(center = (min(BPcum) + max(BPcum)) / 2)
+
+# Step 4: Manhattan plot
+manhattan_plot <- ggplot(don, aes(x = BPcum, y = logp)) +
+  geom_point(aes(color = as.factor(CHR)), alpha = 0.6, size = 1.2) +
+  geom_point(data = subset(don, is_highlight == "yes"), color = "red", size = 1.8) +
+  scale_x_continuous(breaks = axisdf$center, labels = axisdf$CHR) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  scale_color_manual(values = rep(c("grey", "skyblue"), length(unique(don$CHR)))) +
+  labs(x = "Conting", y = "-log10(p-value)") +
+  theme_minimal() +
+  theme( 
+    legend.position = "none",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+# Save to PNG: 20.5 cm x 5 cm = 8.07 in x 1.97 in
+
+ggsave("manhattan_shared_snps20.png",
+       plot = manhattan_plot,
+       width = 10.07, height = 3.00, units = "in", dpi = 300)
+
+# Read SNPs that are GEA ∩ sweep
+sweeps_snps <- read.table("snps_in_sweepsabs2.txt", header = TRUE, sep = "\t")
+sweeps_snps$MergedColumn <- paste(sweeps_snps$CHR, sweeps_snps$POS, sep = "_")
+
+# Flag sweep SNPs
+don$in_sweep <- don$MergedColumn %in% sweeps_snps$MergedColumn
+
+# Subset sweep SNPs and order LEFT → RIGHT by BPcum
+plot_hits <- don %>%
+  filter(in_sweep) %>%
+  arrange(BPcum) %>%      # <-- LEFT TO RIGHT
+  mutate(label_num = row_number())
+
+
+library(ggrepel)
+
+manhattan_plot <- ggplot(don, aes(x = BPcum, y = logp)) +
+  
+  # Background SNPs
+  geom_point(aes(color = as.factor(CHR)), alpha = 0.6, size = 1.2) +
+  scale_color_manual(values = rep(c("grey60", "skyblue"),
+                                  length(unique(don$CHR)))) +
+  
+  # LFMM ∩ GF outliers
+  geom_point(data = subset(don, outlier_flag == "YES"),
+             color = "red", size = 1.8) +
+  
+  # GEA ∩ sweep SNPs
+  geom_point(data = plot_hits,
+             color = "black", size = 2.4) +
+  
+  # Number labels (LEFT → RIGHT)
+  geom_text_repel(
+    data = plot_hits,
+    aes(label = label_num),
+    size = 4,
+    box.padding = 0.25,
+    point.padding = 0.15,
+    max.overlaps = Inf,
+    segment.color = "grey50"
+  ) +
+  
+  scale_x_continuous(breaks = axisdf$center, labels = axisdf$CHR) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Contig", y = "-log10(p-value)") +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+ggsave("manhattan_shared_snpsAV.png",
+       plot = manhattan_plot,
+       width = 10.07, height = 3.00,
+       units = "in", dpi = 300)
+
+# If not already loaded:
+library(dplyr)
+library(gridExtra)
+
+# plot_hits should already be your numbered SNPs ordered left->right:
+# plot_hits <- don %>% filter(in_sweep) %>% arrange(BPcum) %>% mutate(label_num=row_number())
+
+key_df <- plot_hits %>%
+  transmute(
+    Number = label_num,
+    Contig = as.character(CHR),
+    POS = as.integer(POS),
+    SNP = paste0(CHR, ":", POS),
+    `-log10(p)` = round(logp, 3)
+  ) %>%
+  arrange(Number)
+
+# Save as a PDF table (auto-splits across pages if long)
+pdf("Numbered_SNP_key.pdf", width = 8.27, height = 11.69)  # A4 portrait
+gridExtra::grid.table(key_df, rows = NULL)
+dev.off()
