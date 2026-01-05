@@ -1,7 +1,54 @@
+###################################################################################################
+# Annotated analysis scripts for Molecular Ecology publication
+#
+# IMPORTANT:
+#   - All executable commands below are preserved exactly as provided by the authors.
+#   - Only COMMENT LINES were added for clarification and reproducibility.
+#   - Any absolute paths appearing in commands reflect the original compute environment and may need
+#     to be adapted on other systems. Paths are NOT re-written inside commands to avoid changing code.
+#
+# How to use:
+#   - Run each section in order (assembly → trimming → mapping → SNP calling → filtering → downstream analyses).
+#   - Ensure required software is installed and available on your PATH (or adjust paths in your environment).
+#
+# Notes on portability:
+#   - Replace system-specific locations (e.g., /scratch, /home/...) via environment modules, symlinks, or by
+#     editing copies of the script for your local system (keep this archived version unchanged).
+###################################################################################################
+
+###################################################################################################
+# SECTION: Genome assembly
+# Purpose:
+#   Generate a draft reference genome assembly (hybrid approach).
+# Inputs:
+#   - Illumina paired-end reads (quality-filtered/trimmed FASTQ).
+#   - PacBio HiFi reads (FASTQ/FASTA as required by assembler).
+# Outputs:
+#   - Draft genome assembly output directory/files produced by assembler(s).
+# Key tools:
+#   - Wengan
+#   - SPAdes
+###################################################################################################
+
 #######################################Genome assembly
 perl wengan.pl -x pacraw -a M -s AV_clean_L004_R1_001.fastq.gz,AV_clean_L004_R2_001.fastq.gz -l AV_hifi.fastq.gz -p asm1 -t 112 -g 350
 
 spades.py --pe1-1 AV_FKDN240239034-1A_HLWGHDSXC_L4_clean_1.fq.gz --pe1-2 AV_FKDN240239034-1A_HLWGHDSXC_L4_clean_2.fq.gz --pe1-1 AV_FKDN240239034-1A_H77JKDSXC_L2_clean_1.fq.gz --pe1-2 AV_FKDN240239034-1A_H77JKDSXC_L2_clean_2.fq.gz --pacbio AV_hifi.fastq -t 115 -o 
+
+###################################################################################################
+# SECTION: Quality filtering and adapter trimming (Illumina)
+# Purpose:
+#   Remove adapter contamination and low-quality bases from paired-end reads prior to mapping.
+#   Process files in a loop to generate cleaned paired-end FASTQ files.
+# Inputs:
+#   - Raw Illumina paired-end FASTQ files (R1/R2).
+#   - Adapter reference FASTA (e.g., Nextera adapters).
+# Outputs:
+#   - Cleaned paired-end FASTQ files (R1/R2).
+#   - Trimming statistics file (trimstats.txt).
+# Key tools:
+#   - BBMap: bbduk.sh
+###################################################################################################
 
 ##############Quality filtering and adapter trimming
 bash
@@ -34,6 +81,24 @@ do
         stats=trimstats.txt ;       # Output trimming statistics to trimstats.txt
     
 done
+
+###################################################################################################
+# SECTION: Read mapping and SNP calling preparation
+# Purpose:
+#   Map cleaned reads to the reference genome, sort/index BAMs, remove PCR duplicates.
+#   Produce deduplicated BAMs suitable for multisample variant calling.
+# Inputs:
+#   - Cleaned paired-end FASTQ files (R1/R2).
+#   - Reference genome FASTA (indexed for bwa-mem2).
+# Outputs:
+#   - Aligned BAM files (unsorted).
+#   - Sorted and indexed BAM files.
+#   - Deduplicated BAM files (+ indices).
+# Key tools:
+#   - bwa-mem2
+#   - samtools
+#   - GATK MarkDuplicates
+###################################################################################################
 
 #####################Mapping and snp calling
 
@@ -94,6 +159,19 @@ cd /scratch/panas/bam/
 ls *.rmd.bam > all_bams.list
 
 
+###################################################################################################
+# SECTION: Variant calling (multisample SNP calling)
+# Purpose:
+#   Call SNPs jointly across all deduplicated BAM files.
+# Inputs:
+#   - Reference genome FASTA.
+#   - List of deduplicated BAM files (all_bams.list).
+# Outputs:
+#   - Raw multisample VCF (XXcv.vcf).
+# Key tools:
+#   - BBMap: callvariants.sh
+###################################################################################################
+
 #### CallVariants SNP Caller ####
 /home/Downloads/bbmap/callvariants.sh \
     ref=/scratch/genomic.fna.gz \   # Reference genome file
@@ -108,6 +186,27 @@ ls *.rmd.bam > all_bams.list
     minreadmapq=15 \                      # Minimum mapping quality of individual reads
     strandedcov=t \                       # Enable stranded coverage calculation
     -Xmx501593m                           # Set maximum memory allocation (approximately 501GB)
+
+###################################################################################################
+# SECTION: SNP filtering and QC (VCF-level and individual-level)
+# Purpose:
+#   Compress/index the raw VCF.
+#   Apply missingness, allele count/frequency, quality, and depth filters.
+#   Assess potential genotyping error and remove low-quality individuals.
+#   Optional: additional stringent filtering for downstream analyses (diversity/divergence/structure).
+# Inputs:
+#   - Raw multisample VCF (XXcv.vcf).
+#   - VCFtools/BCFtools/tabix-compatible environment.
+# Outputs:
+#   - Filtered VCF(s) for downstream analyses (e.g., raw.g5mac3*, DP5g95maf05q30*).
+#   - Error summaries (errorcount).
+#   - Lists of individuals removed (e.g., lowDP.indv).
+# Key tools:
+#   - bgzip
+#   - tabix
+#   - VCFtools
+#   - ErrorCount.sh
+###################################################################################################
 
 ##################SNP filtering
 
@@ -176,6 +275,19 @@ vcftools --vcf DP5g95maf05q30.recode.vcf --hardy --out test_hwe    # Check Hardy
 
 ##### Filter SNPs Based on Mean Observed Heterozygosity > 0.6 #####
 python SnpsHE.py   # Run custom Python script to identify SNPs with high heterozygosity (potential errors)
+
+###################################################################################################
+# SECTION: Custom script: SnpsHE.py (excess heterozygosity filtering)
+# Purpose:
+#   Parse VCFtools HWE output to identify SNPs with high observed heterozygosity (>60%)
+#   and write their CHR/POS positions for downstream removal.
+# Inputs:
+#   - VCFtools Hardy–Weinberg output file (test_hwe.hwe).
+# Outputs:
+#   - Text file listing SNP positions with high heterozygosity (SNPShighPropHE.txt).
+# Key tools:
+#   - Python (standard library)
+###################################################################################################
 
 ######################################################SnpsHE.py
 #!/usr/bin/env python
@@ -249,6 +361,19 @@ plink2 --bfile XXXadm \                                 # Input binary PLINK fil
     --set-missing-var-ids @:#\$r:\$a \                    # Generate unique IDs for missing SNPs
     --out DP5g95maf05q30filteredHeLDpruned             # Output VCF file after linkage pruning
 
+###################################################################################################
+# SECTION: Population genetic analyses: genetic diversity
+# Purpose:
+#   Compute diversity metrics (e.g., heterozygosity) by population using R.
+# Inputs:
+#   - Filtered VCF suitable for population genetics analyses.
+#   - Population assignment file (Pop.txt).
+# Outputs:
+#   - Tables/objects with heterozygosity and related diversity summaries.
+# Key tools:
+#   - R: vcfR, adegenet, hierfstat, dartR
+###################################################################################################
+
 ###################genetic diversity using dartR
 R
 ###### Load Required Libraries ######
@@ -280,6 +405,19 @@ df <- gl.report.heterozygosity(glx, method = "pop", plot.out = FALSE)
 # - plot.out = FALSE: Suppress automatic plotting of results
 
 
+###################################################################################################
+# SECTION: Population genetic analyses: genetic divergence (FST)
+# Purpose:
+#   Estimate population differentiation (FST) with bootstrap confidence intervals.
+# Inputs:
+#   - Filtered VCF suitable for population genetics analyses.
+#   - Population assignments (vector or file).
+# Outputs:
+#   - CSV outputs for FST values, p-values, bootstrap replicates.
+# Key tools:
+#   - R: vcfR, StAMPP
+###################################################################################################
+
 #####################genetic divergence using stampp
 
 R
@@ -297,7 +435,7 @@ x2 <- as.matrix(x)                        # Convert genlight to matrix format
 sample <- row.names(x2)                   # Extract sample names from matrix rows
 
 # Specify population names manually as a vector, matching the number of samples in x2
-pop.names <- c("1", "1", "1", "1", "2", "2", "2", "2", "3", "3", "3", "3")
+pop.names <- c("1", "1", "1", "1", "2", "2", "2", "2", "3", "3", "3", "3",...,...)
 
 ###### Convert Allele Counts to Frequencies and Prepare Data for StAMPP ######
 ploidy <- ploidy(x)                       # Extract ploidy information from genlight object
@@ -321,6 +459,19 @@ write.csv(fst$Bootstraps, "Genetic_distances_bootstraps.csv")  # Bootstrap value
 write.csv(fst$Pvalues, "Genetic_distances_Pvalues.csv")        # P-values for Fst significance
 write.csv(fst$Fsts, "Genetic_distances_Fsts.csv")              # Fst values between populations
 
+
+###################################################################################################
+# SECTION: Population structure and ordination (PCoA workflow)
+# Purpose:
+#   Infer clusters and visualize population structure (ordination / ellipses).
+# Inputs:
+#   - Filtered VCF suitable for structure analyses.
+#   - Population assignment file (Pop.txt).
+# Outputs:
+#   - Cluster assignments, ordination coordinates, and figures.
+# Key tools:
+#   - R: vcfR, adegenet, ggplot2 (and extensions)
+###################################################################################################
 
 ############### population genetic structure and pca plot
 R
@@ -375,6 +526,23 @@ ggplot(pc_scores, aes(x = PC1, y = PC2, color = pop)) +
     axis.text = element_text(size = 10)
   )
   
+###################################################################################################
+# SECTION: Selection / local adaptation analyses (overview)
+# Purpose:
+#   Estimate allele frequencies by group, run genotype–environment association (LFMM),
+#   and rank candidate SNPs using Gradient Forest.
+# Inputs:
+#   - Imputed/filtered genotype data (VCF and/or tabular genotype matrix).
+#   - Group membership lists (keep files) and environmental predictors.
+# Outputs:
+#   - Allele-frequency tables, LFMM significant hits, GradientForest importance rankings.
+# Key tools:
+#   - VCFtools
+#   - PLINK2
+#   - R: lfmm, gradientForest
+#   - Python: merge_afreq.py
+###################################################################################################
+
 ##################### for selection analyses
 
 ##############calculate allele frequencies
@@ -411,6 +579,19 @@ echo "Pipeline execution completed."
 ### Step 3: Merge Allele Frequency Files ###
 python merge_afreq.py ./output.txt
 # Run `merge_afreq.py` to merge allele frequency results for each population into a single file
+###################################################################################################
+# SECTION: Custom script: merge_afreq.py (merge PLINK2 .afreq files)
+# Purpose:
+#   Merge multiple PLINK2 allele-frequency outputs into one wide table.
+#   Rows correspond to populations/groups; columns correspond to SNP IDs.
+# Inputs:
+#   - Directory containing *.afreq files (PLINK2 --freq output).
+# Outputs:
+#   - Merged allele-frequency table written to a user-specified output path.
+# Key tools:
+#   - Python: os, glob, argparse, csv, re
+###################################################################################################
+
 ##############################merge_afreq.py
 #!/usr/bin/env python
 # coding: utf-8
@@ -617,6 +798,26 @@ cat("\n✅ GradientForest analysis complete. Top 1% SNPs saved to 'top_snps_to_e
 
 ##############################
 #
+###################################################################################################
+# SECTION: Selective sweeps (nSL) and integration with GEA candidates
+# Purpose:
+#   Detect selection signals using nSL, normalize results, define outlier regions,
+#   extend regions, and intersect sweep regions with candidate SNP sets.
+# Inputs:
+#   - Filtered VCF for sweep analysis (bgzipped + indexed).
+#   - nSL outputs per chromosome/contig.
+#   - Candidate SNP list(s) from GEA / GradientForest / LFMM.
+# Outputs:
+#   - Outlier SNP tables, merged sweep BED regions (and extended regions),
+#   - overlap tables of SNPs falling within sweep regions.
+# Key tools:
+#   - bgzip
+#   - tabix
+#   - bcftools
+#   - awk/sed
+#   - R: GenomicRanges, dplyr
+###################################################################################################
+
 #  SELECTIVE SWEEPS
 #
 ##########################
@@ -749,6 +950,22 @@ cat("Proportion of SNPs in sweeps:",
 	
 ##########################################################
 #
+###################################################################################################
+# SECTION: Visualization: Manhattan plot and numbered hit key
+# Purpose:
+#   Generate Manhattan plots highlighting shared outliers and annotate subsets.
+#   Create a numbered key table for annotated SNPs.
+# Inputs:
+#   - Baseline association results (LFMMbaseline.txt).
+#   - Outlier tables (LFMM outliers, GradientForest top SNPs).
+#   - Optional sweep-overlap SNP list.
+# Outputs:
+#   - PNG Manhattan plots.
+#   - PDF table mapping label numbers to SNP coordinates and -log10(p).
+# Key tools:
+#   - R: ggplot2, ggrepel, dplyr, gridExtra
+###################################################################################################
+
 #  Manhattan-plot
 ##########################################################
 # Read baseline data
