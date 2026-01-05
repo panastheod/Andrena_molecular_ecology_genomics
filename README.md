@@ -14,7 +14,7 @@ analyses.
 5. Population genetic analyses
 6. Genotype–environment association
 7. Selective sweep detection
-8. Visualization (PCA, Manhattan plots)
+8. Visualization (Manhattan plots)
 
 All scripts are provided exactly as executed for the analyses.
 
@@ -103,6 +103,4 @@ Outlier regions were merged and intersected with GEA SNPs.
 
 ### 8. Visualization
 **Plots:**
-- PCA
 - Manhattan plots
-- Annotated sweep intersections
