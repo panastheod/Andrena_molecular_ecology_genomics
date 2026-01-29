@@ -16,6 +16,7 @@ analyses.
 7. Selective sweep detection
 8. Visualization (Manhattan plots)
 9. Functional convergence
+    
 All scripts are provided exactly as executed for the analyses.
 
 ---
