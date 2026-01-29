@@ -1,6 +1,6 @@
 # Andrena_molecular_ecology_genomics
 Different paths, similar pressures: divergent drivers of genetic diversity despite convergent genomic signatures of selection in response to urban intensity in two oligolectic bee species
-# Molecular Ecology Genomic Analysis Pipeline
+# Population Genomic Analysis Pipeline
 
 This repository contains all scripts used for genome assembly, SNP calling,
 population genomics, genotype–environment association, and selective sweep
