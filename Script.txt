@@ -1148,3 +1148,317 @@ key_df <- plot_hits %>%
 pdf("Numbered_SNP_key.pdf", width = 8.27, height = 11.69)  # A4 portrait
 gridExtra::grid.table(key_df, rows = NULL)
 dev.off()
+
+## ============================================================
+## Functional convergence across 2 species (GO semantic similarity)
+## ONE .map file (shared gene-to-GO mapping)
+## Wang semantic similarity + BMA + permutation test
+##
+## Inputs:
+##  - one topGO-style .map file (gene -> GO terms) used as the shared GO universe
+##  - enriched GO term lists for two species (GO_A_test, GO_B_test)
+##
+## Output:
+##  - similarity for BP/MF/CC (where possible)
+##  - combined similarity (mean across available ontologies)
+##  - permutation p-values
+## ============================================================
+
+## ---- 0) Packages ----
+suppressPackageStartupMessages({
+  library(topGO)         # readMappings
+  library(GOSemSim)      # mgoSim, godata
+  library(GO.db)         # GO graph + GOTERM
+  library(AnnotationDbi) # Ontology()
+})
+
+## ---- 1) Helper functions ----
+
+# Read topGO mapping file: gene -> GO terms
+read_go_map <- function(map_path) {
+  m <- readMappings(file = map_path)
+  m <- lapply(m, as.character)
+  m
+}
+
+# Extract all unique GO terms from gene2GO list
+all_go_terms <- function(gene2go) {
+  x <- unique(unlist(gene2go, use.names = FALSE))
+  x <- x[!is.na(x)]
+  x <- trimws(x)
+  x <- x[nzchar(x)]
+  unique(x)
+}
+
+# Filter GO terms to those present in GO.db and optionally a given ontology
+filter_go_terms <- function(go_vec, ont = c("BP", "MF", "CC", "ALL")) {
+  ont <- match.arg(ont)
+  
+  go_vec <- unique(go_vec)
+  go_vec <- go_vec[!is.na(go_vec)]
+  go_vec <- trimws(go_vec)
+  go_vec <- go_vec[nzchar(go_vec)]
+  
+  # Keep only valid GO IDs present in GO.db
+  go_vec <- go_vec[go_vec %in% keys(GO.db, keytype = "GOID")]
+  
+  # Filter by ontology if requested
+  if (ont != "ALL") {
+    keep <- vapply(go_vec, function(id) {
+      term <- GOTERM[[id]]
+      if (is.null(term)) return(FALSE)
+      Ontology(term) == ont
+    }, logical(1))
+    go_vec <- go_vec[keep]
+  }
+  unique(go_vec)
+}
+
+# Two-species semantic convergence using ONE shared universe derived from ONE .map file
+two_species_semantic_convergence_one_map <- function(
+    GO_A, GO_B,
+    GO_universe_all,           # vector of all GO IDs from the .map file
+    nperm = 10000, seed = 123,
+    min_terms = 2,
+    min_universe = 20,         # a bit clearer than min_terms*10; tweak if needed
+    verbose = TRUE
+) {
+  onts <- c("BP", "MF", "CC")
+  
+  obs_list <- list()
+  perm_list <- list()
+  meta <- data.frame(ontology = character(), nA = integer(), nB = integer(), universe = integer())
+  
+  for (ont in onts) {
+    U_ont <- filter_go_terms(GO_universe_all, ont = ont)
+    A_ont <- intersect(filter_go_terms(GO_A, ont = ont), U_ont)
+    B_ont <- intersect(filter_go_terms(GO_B, ont = ont), U_ont)
+    
+    meta <- rbind(meta, data.frame(
+      ontology = ont,
+      nA = length(A_ont),
+      nB = length(B_ont),
+      universe = length(U_ont)
+    ))
+    
+    if (length(A_ont) < min_terms || length(B_ont) < min_terms || length(U_ont) < min_universe) {
+      if (verbose) message(sprintf("Skipping %s (nA=%d, nB=%d, |U|=%d)", ont, length(A_ont), length(B_ont), length(U_ont)))
+      next
+    }
+    
+    godata_obj <- godata(ont = ont, computeIC = FALSE)
+    
+    # Observed similarity
+    obs <- mgoSim(A_ont, B_ont, semData = godata_obj, measure = "Wang", combine = "BMA")
+    
+    # Permutation distribution
+    set.seed(seed)
+    perm <- numeric(nperm)
+    for (i in seq_len(nperm)) {
+      randA <- sample(U_ont, size = length(A_ont), replace = FALSE)
+      randB <- sample(U_ont, size = length(B_ont), replace = FALSE)
+      perm[i] <- mgoSim(randA, randB, semData = godata_obj, measure = "Wang", combine = "BMA")
+    }
+    
+    obs_list[[ont]] <- obs
+    perm_list[[ont]] <- perm
+  }
+  
+  if (length(obs_list) == 0) {
+    stop("No ontology had enough GO terms after filtering. Check your GO lists or the .map-derived universe.")
+  }
+  
+  obs_vec <- unlist(obs_list)
+  perm_mat <- do.call(cbind, perm_list)
+  
+  obs_combined <- mean(obs_vec)
+  perm_combined <- rowMeans(perm_mat)
+  p_combined <- mean(perm_combined >= obs_combined)
+  
+  p_by_ont <- vapply(names(obs_list), function(ont) {
+    mean(perm_list[[ont]] >= obs_list[[ont]])
+  }, numeric(1))
+  
+  list(
+    meta = meta,
+    used_ontologies = names(obs_list),
+    observed_by_ontology = obs_vec,
+    p_by_ontology = p_by_ont,
+    observed_combined = obs_combined,
+    p_combined = p_combined,
+    perm_combined = perm_combined,
+    perm_by_ontology = perm_list
+  )
+}
+
+## ============================================================
+## 2) INPUT FILE (ONE shared .map file)
+## ============================================================
+setwd("C:/Users/panat/Desktop/Desktop1/Lusie/PhD/Aflorea")
+map_shared <- "AMgrouped_output.map.txt"   # <-- EDIT
+
+geneID2GO_shared <- read_go_map(map_shared)
+
+# Shared GO universe derived from the single .map file
+GO_universe_all <- all_go_terms(geneID2GO_shared)
+
+## ============================================================
+## 3) INPUT GO LISTS (two species)
+## ============================================================
+## Replace these with YOUR enriched GO IDs (strings "GO:xxxxxxx")
+
+GO_A_test <- c("GO:0018022",
+               "GO:0015718",
+               "GO:0018344",
+               "GO:0120252",
+               "GO:0018342",
+               "GO:0051492",
+               "GO:0097354",
+               "GO:0043149",
+               "GO:0030038",
+               "GO:0035076",
+               "GO:0141193",
+               "GO:0034446",
+               "GO:0007229",
+               "GO:0030518",
+               "GO:0007414",
+               "GO:0016126",
+               "GO:0032231",
+               "GO:0035160",
+               "GO:0007157",
+               "GO:0009725",
+               "GO:0021551",
+               "GO:1901655",
+               "GO:0016125",
+               "GO:0071390",
+               "GO:0007160",
+               "GO:0036315",
+               "GO:0045785",
+               "GO:0007032",
+               "GO:0110020",
+               "GO:0070983",
+               "GO:0033627",
+               "GO:0000027",
+               "GO:0007475",
+               "GO:0035099",
+               "GO:0007155",
+               "GO:0044409",
+               "GO:0046718",
+               "GO:1902667",
+               "GO:0010669",
+               "GO:0044403",
+               "GO:0051701",
+               "GO:0097306",
+               "GO:0006694",
+               "GO:0031334",
+               "GO:0031589",
+               "GO:0035162",
+               "GO:0016279",
+               "GO:0050661",
+               "GO:0008028",
+               "GO:0015293",
+               "GO:0050431",
+               "GO:0008318",
+               "GO:0016653",
+               "GO:0070402",
+               "GO:0004653",
+               "GO:0001968",
+               "GO:0010181",
+               "GO:0005521",
+               "GO:0016709",
+               "GO:0016628",
+               "GO:0015026",
+               "GO:0005515",
+               "GO:0016675",
+               "GO:0005245",
+               "GO:0050840",
+               "GO:0019955",
+               "GO:0004659",
+               "GO:0001618",
+               "GO:0043014",
+               "GO:0008376",
+               "GO:0140272",
+               "GO:0016627",
+               "GO:0031527",
+               "GO:0016323",
+               "GO:0009925",
+               "GO:0031258",
+               "GO:0030014",
+               "GO:0031616",
+               "GO:0045178",
+               "GO:0031528",
+               "GO:0005637",
+               "GO:0044295")  # <-- species A enriched GO terms
+GO_B_test <- c("GO:0034330",
+               "GO:0006805",
+               "GO:0071466",
+               "GO:0051590",
+               "GO:0030174",
+               "GO:0001956",
+               "GO:0048015",
+               "GO:0035161",
+               "GO:0072697",
+               "GO:0009410",
+               "GO:0050808",
+               "GO:0008366",
+               "GO:0006301",
+               "GO:0035025",
+               "GO:0007272",
+               "GO:0007479",
+               "GO:0006491",
+               "GO:0007482",
+               "GO:0000028",
+               "GO:0035216",
+               "GO:0007449",
+               "GO:0035223",
+               "GO:0031333",
+               "GO:1990709",
+               "GO:0044085",
+               "GO:0060857",
+               "GO:0090329",
+               "GO:0006270",
+               "GO:0050806",
+               "GO:0060856",
+               "GO:0009954",
+               "GO:0030032",
+               "GO:0071711",
+               "GO:0008190",
+               "GO:0016712",
+               "GO:0004683",
+               "GO:0005049",
+               "GO:0008395",
+               "GO:0043167",
+               "GO:0052742",
+               "GO:0016773",
+               "GO:0036094",
+               "GO:0035250",
+               "GO:0001727",
+               "GO:0071212",
+               "GO:0019898")  # <-- species B enriched GO terms
+
+## ============================================================
+## 4) RUN TWO-SPECIES ANALYSIS
+## ============================================================
+
+res_A_B <- two_species_semantic_convergence_one_map(
+  GO_A = GO_A_test,
+  GO_B = GO_B_test,
+  GO_universe_all = GO_universe_all,
+  nperm = 100,
+  seed = 123,
+  min_terms = 2,
+  min_universe = 20,
+  verbose = TRUE
+)
+
+## Inspect results
+res_A_B$meta
+res_A_B$used_ontologies
+res_A_B$observed_by_ontology
+res_A_B$p_by_ontology
+res_A_B$observed_combined
+res_A_B$p_combined
+
+## Optional plot: combined permutation null
+# hist(res_A_B$perm_combined, main = "A vs B (combined)", xlab = "Permuted Wang similarity (BMA)")
+# abline(v = res_A_B$observed_combined, lwd = 2)
