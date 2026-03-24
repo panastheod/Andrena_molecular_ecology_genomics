@@ -493,7 +493,7 @@ pop(gl) <- as.factor(pop.data$pop)                  # Assign population data to 
 ######## find clusters ########
 grp <- find.clusters(gl, max.n.clust = 19)          # Use `find.clusters` to identify clusters
 # - max.n.clust = 19: Set the maximum number of clusters, looking for a plateau in BIC plot
-
+pc <- gl.pcoa(gl)
 library(ggplot2)
 library(ggforce)
 library(RColorBrewer)  # Load RColorBrewer for color palettes
